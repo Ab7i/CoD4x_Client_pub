@@ -61,6 +61,7 @@ add_library(cod4x SHARED
     src/sv_game.c
     src/sv_world.c
     src/win_input.c
+    src/gamepad.c
     src/win_wndproc.c
     src/win_syscon.c
     src/win_sys.c
@@ -107,6 +108,7 @@ target_link_libraries(cod4x PRIVATE
     ws2_32
     dnsapi
     winmm
+    xinput9_1_0
     shell32
     user32
     gdi32

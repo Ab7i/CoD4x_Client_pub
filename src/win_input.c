@@ -38,6 +38,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "qcommon.h"
 #include "cl_input.h"
 #include "client.h"
+#include "gamepad.h"
 #include <windows.h>
 
 cvar_t * in_mouse;
@@ -302,7 +303,7 @@ void IN_StartupMouse()
 void IN_Startup()
 {
   IN_StartupMouse();
-  //IN_StartupGamepads();
+  IN_StartupGamepads();
   Cvar_ClearModified(in_mouse);
 
 }
@@ -452,11 +453,10 @@ void __cdecl IN_Frame()
 	    IN_MouseMove();
 	  }
 
-      /*
-	  if ( IN_IsForegroundWindow() )
+      if ( IN_IsForegroundWindow() )
       {
         IN_GamepadsMove();
-      }*/
+      }
     }
     else
     {
