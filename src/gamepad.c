@@ -5,6 +5,11 @@
  * triggers (treated as digital via a threshold) are delivered to the
  * engine as SE_KEY events through Com_QueueEvent, so they bind exactly
  * like keyboard/mouse keys. Connect/disconnect logging is kept.
+ *
+ * Also includes a TEMPORARY trigger-drift diagnostic gated behind the
+ * cl_gamepad_debug cvar: it logs raw LT/RT values whenever they change,
+ * to confirm whether the triggers oscillate while at rest. This debug
+ * block is removed once the drift question is settled.
  */
 
 #include "q_shared.h"
@@ -29,6 +34,10 @@ static cvar_t *cl_gamepad_deadzone_right;
 static cvar_t *cl_gamepad_invert_y;
 static cvar_t *cl_gamepad_accel_curve;
 
+// Temporary diagnostic cvar (flags 0 -- not archived). Removed with the
+// debug block once the trigger-drift question is resolved.
+static cvar_t *cl_gamepad_debug;
+
 // Options for the cl_gamepad_accel_curve enum cvar (NULL-terminated).
 static const char *gamepad_accel_curve_names[] =
 {
@@ -46,6 +55,8 @@ typedef struct
     WORD     prev_buttons;  // wButtons from the previous polled frame
     qboolean prev_lt_down;  // left trigger digital state, previous frame
     qboolean prev_rt_down;  // right trigger digital state, previous frame
+    BYTE     prev_lt_raw;   // raw left-trigger value, previous frame (debug)
+    BYTE     prev_rt_raw;   // raw right-trigger value, previous frame (debug)
 } gamepadState_t;
 
 static gamepadState_t s_gamepad;
@@ -115,10 +126,16 @@ void IN_StartupGamepads(void)
         "cl_gamepad_accel_curve", gamepad_accel_curve_names, 0, CVAR_ARCHIVE,
         "Controller look acceleration curve");
 
+    cl_gamepad_debug = Cvar_RegisterBool(
+        "cl_gamepad_debug", qfalse, 0,
+        "Log raw controller trigger values (temporary diagnostic)");
+
     s_gamepad.connected = qfalse;
     s_gamepad.prev_buttons = 0;
     s_gamepad.prev_lt_down = qfalse;
     s_gamepad.prev_rt_down = qfalse;
+    s_gamepad.prev_lt_raw = 0;
+    s_gamepad.prev_rt_raw = 0;
 
     Com_Printf(CON_CHANNEL_SYSTEM, "XInput initialized\n");
 }
@@ -172,6 +189,19 @@ void IN_GamepadsMove(void)
         s_gamepad.prev_rt_down = qfalse;
         Com_Printf(CON_CHANNEL_SYSTEM, "Gamepad: connected (slot 0)\n");
     }
+
+    // TEMPORARY drift diagnostic: print raw trigger values whenever
+    // either one changes, gated behind cl_gamepad_debug. Removed once
+    // the trigger-drift question is settled.
+    if ( cl_gamepad_debug->boolean &&
+         ( state.Gamepad.bLeftTrigger  != s_gamepad.prev_lt_raw ||
+           state.Gamepad.bRightTrigger != s_gamepad.prev_rt_raw ) )
+    {
+        Com_Printf(CON_CHANNEL_SYSTEM, "Gamepad debug: LT=%d RT=%d\n",
+            state.Gamepad.bLeftTrigger, state.Gamepad.bRightTrigger);
+    }
+    s_gamepad.prev_lt_raw = state.Gamepad.bLeftTrigger;
+    s_gamepad.prev_rt_raw = state.Gamepad.bRightTrigger;
 
     // Digital buttons: queue a key event for every bit that changed.
     changed = state.Gamepad.wButtons ^ s_gamepad.prev_buttons;
