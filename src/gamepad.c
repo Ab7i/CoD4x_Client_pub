@@ -1,29 +1,34 @@
 /*
  * gamepad.c -- native game controller support (XInput).
  *
- * Commit 2: button input enabled. Digital buttons and the two analog
- * triggers (treated as digital via a threshold) are delivered to the
- * engine as SE_KEY events through Com_QueueEvent, so they bind exactly
- * like keyboard/mouse keys. Connect/disconnect logging is kept.
- *
- * Also includes a TEMPORARY trigger-drift diagnostic gated behind the
- * cl_gamepad_debug cvar: it logs raw LT/RT values whenever they change,
- * to confirm whether the triggers oscillate while at rest. This debug
- * block is removed once the drift question is settled.
+ * Stage 3A: analog sticks. Right stick drives the view through the same
+ * CL_MouseEvent path the mouse uses; left stick drives 8-way digital
+ * movement via synthetic arrow-key events. Buttons + triggers as Commit 2.
+ * On disconnect, every held input is released (Gamepad_ReleaseAll) so
+ * nothing stays stuck "down" in the engine. Includes temporary
+ * cl_gamepad_debug logging for the triggers and both sticks.
  */
 
 #include "q_shared.h"
 #include "win_sys.h"
 #include "qcommon.h"
 #include "keycodes.h"
+#include "cl_input.h"
 #include "gamepad.h"
 
 #include <windows.h>
 #include <xinput.h>
+#include <math.h>
 
-// Left/right trigger analog value (0-255) at or above which the trigger
-// counts as a pressed digital button.
-#define TRIGGER_THRESHOLD 30
+// Left/right trigger analog value (0-255) at/above which it counts down.
+#define TRIGGER_THRESHOLD  30
+
+// XInput thumbstick full-scale value.
+#define THUMB_MAX          32767.0f
+
+// Converts a normalized stick magnitude (0..1, after sensitivity) into
+// mouse-like per-frame counts for CL_MouseEvent. Primary look-feel knob.
+#define GAMEPAD_LOOK_SCALE 12.0f
 
 // Controller settings. All CVAR_ARCHIVE so they persist to config_mp.cfg.
 static cvar_t *cl_gamepad;
@@ -34,8 +39,7 @@ static cvar_t *cl_gamepad_deadzone_right;
 static cvar_t *cl_gamepad_invert_y;
 static cvar_t *cl_gamepad_accel_curve;
 
-// Temporary diagnostic cvar (flags 0 -- not archived). Removed with the
-// debug block once the trigger-drift question is resolved.
+// Temporary diagnostic cvar (flags 0 -- not archived).
 static cvar_t *cl_gamepad_debug;
 
 // Options for the cl_gamepad_accel_curve enum cvar (NULL-terminated).
@@ -46,9 +50,7 @@ static const char *gamepad_accel_curve_names[] =
     NULL
 };
 
-// Per-frame controller tracking. XInput needs no explicit device init;
-// XInputGetState is polled directly, so this only holds what we need for
-// edge detection and connect/disconnect transitions.
+// Per-frame controller tracking for edge detection and transitions.
 typedef struct
 {
     qboolean connected;     // slot 0 device connected as of the last poll
@@ -57,6 +59,10 @@ typedef struct
     qboolean prev_rt_down;  // right trigger digital state, previous frame
     BYTE     prev_lt_raw;   // raw left-trigger value, previous frame (debug)
     BYTE     prev_rt_raw;   // raw right-trigger value, previous frame (debug)
+    qboolean prev_move_fwd;   // left-stick forward state, previous frame
+    qboolean prev_move_back;  // left-stick backward state, previous frame
+    qboolean prev_move_left;  // left-stick strafe-left state, previous frame
+    qboolean prev_move_right; // left-stick strafe-right state, previous frame
 } gamepadState_t;
 
 static gamepadState_t s_gamepad;
@@ -128,7 +134,7 @@ void IN_StartupGamepads(void)
 
     cl_gamepad_debug = Cvar_RegisterBool(
         "cl_gamepad_debug", qfalse, 0,
-        "Log raw controller trigger values (temporary diagnostic)");
+        "Log raw controller trigger/stick values (temporary diagnostic)");
 
     s_gamepad.connected = qfalse;
     s_gamepad.prev_buttons = 0;
@@ -136,8 +142,221 @@ void IN_StartupGamepads(void)
     s_gamepad.prev_rt_down = qfalse;
     s_gamepad.prev_lt_raw = 0;
     s_gamepad.prev_rt_raw = 0;
+    s_gamepad.prev_move_fwd = qfalse;
+    s_gamepad.prev_move_back = qfalse;
+    s_gamepad.prev_move_left = qfalse;
+    s_gamepad.prev_move_right = qfalse;
 
     Com_Printf(CON_CHANNEL_SYSTEM, "XInput initialized\n");
+}
+
+/*
+===========
+Gamepad_ReleaseMovement
+
+Sends a release event for any held left-stick movement direction and
+clears the cached states.
+===========
+*/
+static void Gamepad_ReleaseMovement(void)
+{
+    if ( s_gamepad.prev_move_fwd )
+        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_UPARROW, qfalse, 0, NULL );
+    if ( s_gamepad.prev_move_back )
+        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_DOWNARROW, qfalse, 0, NULL );
+    if ( s_gamepad.prev_move_left )
+        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_LEFTARROW, qfalse, 0, NULL );
+    if ( s_gamepad.prev_move_right )
+        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_RIGHTARROW, qfalse, 0, NULL );
+
+    s_gamepad.prev_move_fwd = qfalse;
+    s_gamepad.prev_move_back = qfalse;
+    s_gamepad.prev_move_left = qfalse;
+    s_gamepad.prev_move_right = qfalse;
+}
+
+/*
+===========
+Gamepad_ReleaseAll
+
+Sends a release event for every input currently held -- digital buttons,
+both triggers, and left-stick movement -- then clears all cached states.
+Used on controller disconnect so nothing stays stuck "down" in the engine
+when the pad is unplugged mid-input.
+===========
+*/
+static void Gamepad_ReleaseAll(void)
+{
+    unsigned int i;
+
+    // Digital buttons held in the last polled frame.
+    for ( i = 0; i < GAMEPAD_BUTTON_COUNT; ++i )
+    {
+        if ( s_gamepad.prev_buttons & gamepad_buttons[i].mask )
+            Com_QueueEvent( g_wv.sysMsgTime, SE_KEY,
+                gamepad_buttons[i].keycode, qfalse, 0, NULL );
+    }
+    s_gamepad.prev_buttons = 0;
+
+    // Triggers.
+    if ( s_gamepad.prev_lt_down )
+        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_JOY15, qfalse, 0, NULL );
+    if ( s_gamepad.prev_rt_down )
+        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_JOY16, qfalse, 0, NULL );
+    s_gamepad.prev_lt_down = qfalse;
+    s_gamepad.prev_rt_down = qfalse;
+
+    // Left-stick movement directions.
+    Gamepad_ReleaseMovement();
+}
+
+/*
+===========
+Gamepad_ApplyRightStick
+
+Right stick -> view. Feeds the same CL_MouseEvent accumulator the mouse
+uses, after a radial deadzone, magnitude re-normalization, acceleration
+curve, sensitivity scaling and optional Y inversion.
+===========
+*/
+static void Gamepad_ApplyRightStick(SHORT thumb_rx, SHORT thumb_ry)
+{
+    static SHORT dbg_prev_rx = 0;   // last raw rx that was debug-logged
+    static SHORT dbg_prev_ry = 0;   // last raw ry that was debug-logged
+
+    float rx, ry, magnitude, dz, norm_mag, curve_mag, scale;
+    float dir_x, dir_y;
+    int   dx, dy;
+    qboolean dbg;
+
+    rx = (float)thumb_rx / THUMB_MAX;
+    ry = (float)thumb_ry / THUMB_MAX;
+
+    magnitude = sqrtf( rx * rx + ry * ry );
+    dz = cl_gamepad_deadzone_right->floatval;
+
+    // TEMP debug: log only when a raw axis moved noticeably (> 1000),
+    // gated behind cl_gamepad_debug, to avoid per-frame spam.
+    dbg = qfalse;
+    if ( cl_gamepad_debug->boolean )
+    {
+        int drx = (int)thumb_rx - (int)dbg_prev_rx;
+        int dry = (int)thumb_ry - (int)dbg_prev_ry;
+        if ( drx < 0 ) drx = -drx;
+        if ( dry < 0 ) dry = -dry;
+        if ( drx > 1000 || dry > 1000 )
+        {
+            dbg = qtrue;
+            dbg_prev_rx = thumb_rx;
+            dbg_prev_ry = thumb_ry;
+        }
+    }
+
+    // Radial deadzone: ignore the stick entirely inside the dead circle.
+    if ( magnitude <= dz || magnitude <= 0.0f )
+    {
+        if ( dbg )
+            Com_Printf(CON_CHANNEL_SYSTEM,
+                "Stick R: rx=%d ry=%d mag=%.3f (in deadzone)\n",
+                thumb_rx, thumb_ry, magnitude);
+        return;
+    }
+
+    // Re-normalize the post-deadzone magnitude to 0..1.
+    norm_mag = ( magnitude - dz ) / ( 1.0f - dz );
+    if ( norm_mag > 1.0f )
+        norm_mag = 1.0f;
+
+    // Acceleration curve applied to the magnitude (direction preserved).
+    if ( cl_gamepad_accel_curve->integer == 1 )   // "exponential"
+        curve_mag = norm_mag * norm_mag;
+    else                                          // "linear"
+        curve_mag = norm_mag;
+
+    dir_x = rx / magnitude;
+    dir_y = ry / magnitude;
+
+    scale = cl_gamepad_sens_look->floatval * GAMEPAD_LOOK_SCALE;
+
+    dx = (int)( dir_x * curve_mag * scale );
+    dy = (int)( dir_y * curve_mag * scale );
+
+    // Stick up (positive ry) should look up. Mouse "look up" is negative
+    // dy, so negate by default; cl_gamepad_invert_y keeps it positive.
+    if ( !cl_gamepad_invert_y->boolean )
+        dy = -dy;
+
+    if ( dbg )
+        Com_Printf(CON_CHANNEL_SYSTEM,
+            "Stick R: rx=%d ry=%d mag=%.3f -> dx=%d dy=%d (CL_MouseEvent)\n",
+            thumb_rx, thumb_ry, magnitude, dx, dy);
+
+    if ( dx != 0 || dy != 0 )
+        CL_MouseEvent( 0, 0, dx, dy );
+}
+
+/*
+===========
+Gamepad_ApplyLeftStick
+
+Left stick -> 8-way digital movement. Each axis direction is an on/off
+state past an axial deadzone; edge changes are sent as arrow-key events.
+===========
+*/
+static void Gamepad_ApplyLeftStick(SHORT thumb_lx, SHORT thumb_ly)
+{
+    float    lx, ly, dz;
+    qboolean fwd, back, left, right;
+
+    lx = (float)thumb_lx / THUMB_MAX;
+    ly = (float)thumb_ly / THUMB_MAX;
+    dz = cl_gamepad_deadzone_left->floatval;
+
+    fwd   = ( ly >  dz );
+    back  = ( ly < -dz );
+    left  = ( lx < -dz );
+    right = ( lx >  dz );
+
+    if ( fwd != s_gamepad.prev_move_fwd )
+    {
+        if ( cl_gamepad_debug->boolean )
+            Com_Printf(CON_CHANNEL_SYSTEM,
+                "Stick L: lx=%d ly=%d fwd=%d (was %d) -> K_UPARROW %s\n",
+                thumb_lx, thumb_ly, fwd, s_gamepad.prev_move_fwd,
+                fwd ? "pressed" : "released");
+        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_UPARROW, fwd, 0, NULL );
+        s_gamepad.prev_move_fwd = fwd;
+    }
+    if ( back != s_gamepad.prev_move_back )
+    {
+        if ( cl_gamepad_debug->boolean )
+            Com_Printf(CON_CHANNEL_SYSTEM,
+                "Stick L: lx=%d ly=%d back=%d (was %d) -> K_DOWNARROW %s\n",
+                thumb_lx, thumb_ly, back, s_gamepad.prev_move_back,
+                back ? "pressed" : "released");
+        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_DOWNARROW, back, 0, NULL );
+        s_gamepad.prev_move_back = back;
+    }
+    if ( left != s_gamepad.prev_move_left )
+    {
+        if ( cl_gamepad_debug->boolean )
+            Com_Printf(CON_CHANNEL_SYSTEM,
+                "Stick L: lx=%d ly=%d left=%d (was %d) -> K_LEFTARROW %s\n",
+                thumb_lx, thumb_ly, left, s_gamepad.prev_move_left,
+                left ? "pressed" : "released");
+        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_LEFTARROW, left, 0, NULL );
+        s_gamepad.prev_move_left = left;
+    }
+    if ( right != s_gamepad.prev_move_right )
+    {
+        if ( cl_gamepad_debug->boolean )
+            Com_Printf(CON_CHANNEL_SYSTEM,
+                "Stick L: lx=%d ly=%d right=%d (was %d) -> K_RIGHTARROW %s\n",
+                thumb_lx, thumb_ly, right, s_gamepad.prev_move_right,
+                right ? "pressed" : "released");
+        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_RIGHTARROW, right, 0, NULL );
+        s_gamepad.prev_move_right = right;
+    }
 }
 
 /*
@@ -145,9 +364,6 @@ void IN_StartupGamepads(void)
 IN_GamepadsMove
 
 Per-frame controller poll. Called from IN_Frame().
-Commit 2: queues SE_KEY events for digital buttons and for the two
-triggers (analog, gated by TRIGGER_THRESHOLD). Edge-detected so each
-press/release is sent exactly once.
 ===========
 */
 void IN_GamepadsMove(void)
@@ -168,13 +384,11 @@ void IN_GamepadsMove(void)
     if ( result != ERROR_SUCCESS )
     {
         // Slot 0 empty or device unplugged -- handle silently, no spam.
-        // Log only the connected -> disconnected transition.
+        // Release every held input so nothing stays stuck down.
         if ( s_gamepad.connected )
         {
             s_gamepad.connected = qfalse;
-            s_gamepad.prev_buttons = 0;
-            s_gamepad.prev_lt_down = qfalse;
-            s_gamepad.prev_rt_down = qfalse;
+            Gamepad_ReleaseAll();
             Com_Printf(CON_CHANNEL_SYSTEM, "Gamepad: disconnected (slot 0)\n");
         }
         return;
@@ -187,12 +401,14 @@ void IN_GamepadsMove(void)
         s_gamepad.prev_buttons = 0;
         s_gamepad.prev_lt_down = qfalse;
         s_gamepad.prev_rt_down = qfalse;
+        s_gamepad.prev_move_fwd = qfalse;
+        s_gamepad.prev_move_back = qfalse;
+        s_gamepad.prev_move_left = qfalse;
+        s_gamepad.prev_move_right = qfalse;
         Com_Printf(CON_CHANNEL_SYSTEM, "Gamepad: connected (slot 0)\n");
     }
 
-    // TEMPORARY drift diagnostic: print raw trigger values whenever
-    // either one changes, gated behind cl_gamepad_debug. Removed once
-    // the trigger-drift question is settled.
+    // TEMPORARY drift diagnostic: raw trigger values on change, gated.
     if ( cl_gamepad_debug->boolean &&
          ( state.Gamepad.bLeftTrigger  != s_gamepad.prev_lt_raw ||
            state.Gamepad.bRightTrigger != s_gamepad.prev_rt_raw ) )
@@ -224,7 +440,6 @@ void IN_GamepadsMove(void)
     s_gamepad.prev_buttons = state.Gamepad.wButtons;
 
     // Triggers: analog 0-255, treated as digital buttons via a threshold.
-    // Edge-detected against the cached state so each crossing fires once.
     lt_down = ( state.Gamepad.bLeftTrigger  > TRIGGER_THRESHOLD );
     rt_down = ( state.Gamepad.bRightTrigger > TRIGGER_THRESHOLD );
 
@@ -239,4 +454,8 @@ void IN_GamepadsMove(void)
         Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_JOY16, rt_down, 0, NULL );
         s_gamepad.prev_rt_down = rt_down;
     }
+
+    // Analog sticks.
+    Gamepad_ApplyRightStick( state.Gamepad.sThumbRX, state.Gamepad.sThumbRY );
+    Gamepad_ApplyLeftStick(  state.Gamepad.sThumbLX, state.Gamepad.sThumbLY );
 }
