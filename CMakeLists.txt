@@ -62,6 +62,8 @@ add_library(cod4x SHARED
     src/sv_world.c
     src/win_input.c
     src/gamepad.c
+    src/gamepad_poll.c
+    src/gamepad_buttons.c
     src/win_wndproc.c
     src/win_syscon.c
     src/win_sys.c

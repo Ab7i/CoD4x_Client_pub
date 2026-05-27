@@ -268,8 +268,17 @@ typedef struct {
 /* --- HOOK_CALL sites (5-byte CALL rel32) --- */
 #define IW3MP_GETLOCKEYNAME_CALL_1     (0x4677C0u + 0x6Fu)   /* Gamepad.cpp:2108 */
 #define IW3MP_GETLOCKEYNAME_CALL_2     (0x475DC0u + 0x91u)   /* Gamepad.cpp:2109 */
-#define IW3MP_IN_FRAME_CALL            0x576193u             /* Gamepad.cpp:2305 -- CRITICAL */
 #define IW3MP_CL_KEYEVENT_HK_CALL      0x4FDCBFu             /* Gamepad.cpp:2308 */
+
+/* SUPERSEDED: iw3sp_mod installs IN_Frame_Hk here (Gamepad.cpp:2305) as a
+ * HOOK_CALL replacing the engine's CALL to IN_MouseMove. In CoD4x this
+ * hook is REDUNDANT and MUST NOT be installed: CoD4x already redirects
+ * iw3mp's entire IN_Frame entry point via
+ *     SetCall(0x452A44, IN_Frame);                    [sys_patch.c:1152]
+ * and CoD4x's own IN_Frame in win_input.c:438 already calls our
+ * IN_GamepadsMove() each frame. Kept here purely for cross-reference
+ * against the iw3sp_mod source -- DO NOT install. */
+#define IW3MP_IN_FRAME_CALL_LEGACY     0x576193u             /* Gamepad.cpp:2305 -- documented only */
 
 /* --- HOOK_JUMP sites (5-byte JMP rel32) --- */
 #define IW3MP_KEY_GETCMDASSIGN_JMP     0x4678E0u             /* Gamepad.cpp:2322 */
@@ -285,5 +294,49 @@ typedef struct {
  *   IW3MP_CL_MOUSEEVENT_STUB_JMP    <CL_MouseEvent_Stub host -- needs 0x43F920 twin>
  *   IW3MP_RELOAD_HINT_PTR           <0x4237B0 + byte-pattern-found offset>
  */
+
+/* ===================================================================
+ * 7. Phase 3-B polling API (defined in gamepad_poll.c)
+ *
+ *   Path A: state machine lives in our DLL; engine ABI is NOT touched.
+ *   The dispatch layer (gamepad_buttons.c) and the existing stick code
+ *   (gamepad.c) read from these globals.
+ * =================================================================== */
+
+/* Canonical owner: gamepad_poll.c. Index = port (only port 0 used today). */
+extern gp_state_t      gp_state[GP_MAX_GPAD_COUNT];
+
+/* Raw XInput state cached by the poller for re-use by the stick code in
+ * gamepad.c (avoids a second XInputGetState per frame). Valid only when
+ * gp_state[port].enabled is true. */
+extern XINPUT_GAMEPAD  gp_raw[GP_MAX_GPAD_COUNT];
+
+/* Per-frame poll: refresh device connectivity (throttled), pump
+ * XInputGetState, update digitals / analogs / sticks edge cache.
+ * Safe to call when cl_gamepad is disabled (returns early). */
+void gp_poll_all(void);
+
+/* Edge-detect helpers (port = 0..GP_MAX_GPAD_COUNT-1). */
+float gp_get_button       (int port, gp_button_e button);
+int   gp_is_button_pressed (int port, gp_button_e button);
+int   gp_is_button_released(int port, gp_button_e button);
+int   gp_button_requires_updates(int port, gp_button_e button);
+float gp_get_stick        (int port, gp_stick_e  stick);
+
+/* ===================================================================
+ * 8. Phase 3-B dispatch API (defined in gamepad_buttons.c)
+ *
+ *   Path A delivery via Com_QueueEvent(SE_KEY, ...). The button table
+ *   here maps gp_button_e -> CoD4x keynum (K_JOY1..K_JOY16) to keep
+ *   compatibility with config_mp.cfg bindings shipped in Stage 3A.
+ * =================================================================== */
+
+/* Drive Com_QueueEvent based on per-frame edges in gp_state[port]. */
+void gp_dispatch_buttons(int port);
+
+/* Force-release every input still cached as held; clear lastDigitals/
+ * lastAnalogs. Called on disconnect transition so the engine doesn't
+ * see a frozen "down" key. */
+void gp_release_all(int port);
 
 #endif /* __GAMEPAD_INTERNAL_H__ */

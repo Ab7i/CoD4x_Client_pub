@@ -1,12 +1,36 @@
 /*
  * gamepad.c -- native game controller support (XInput).
  *
- * Stage 3A: analog sticks. Right stick drives the view through the same
- * CL_MouseEvent path the mouse uses; left stick drives 8-way digital
- * movement via synthetic arrow-key events. Buttons + triggers as Commit 2.
- * On disconnect, every held input is released (Gamepad_ReleaseAll) so
- * nothing stays stuck "down" in the engine. Includes temporary
- * cl_gamepad_debug logging for the triggers and both sticks.
+ * Phase 3-B (2026-05-27): button + trigger event delivery is now driven
+ * by the iw3sp_mod-style state machine in gamepad_poll.c / gamepad_buttons.c.
+ * The top-level entry points (IN_StartupGamepads, IN_GamepadsMove) keep
+ * their C signatures so CoD4x's IN_Frame (win_input.c) is unchanged. The
+ * Stage 3A analog-stick handlers (right stick -> view via CL_MouseEvent,
+ * left stick -> 8-way arrow keys) stay intact in this file and will be
+ * replaced by the proper usercmd_s path in Phase 3-C.
+ *
+ * Hook strategy
+ * -------------
+ * iw3sp_mod installs HOOK_CALL at iw3mp 0x576193 to splice IN_Frame_Hk
+ * into the engine's per-frame input pump. We DO NOT install that hook:
+ * CoD4x already redirects iw3mp's entire IN_Frame at 0x452A44
+ * (sys_patch.c) and calls our IN_GamepadsMove() from win_input.c:438.
+ * See gamepad_internal.h, IW3MP_IN_FRAME_CALL_LEGACY for the
+ * cross-reference.
+ *
+ * The original Stage 3A header (Commit 2 + Stage 3A sticks) is preserved
+ * in git history at tag stage3a-complete.
+ *
+ * Path A vs Path B: Phase 3-B is "Path A" -- all button delivery still
+ * lowers to Com_QueueEvent(SE_KEY, ...) just like Stage 3A, so config_mp.cfg
+ * bindings on K_JOY1..K_JOY16 remain valid. Path B (engine playerKeys[]
+ * + Cbuf_AddText by iw3mp VA) lands in Stage 3-D when aim assist forces
+ * us to touch engine internals anyway.
+ *
+ * iw3sp_mod attribution: this file does not itself port code from
+ * iw3sp_mod (the iw3sp_mod logic lives in the sister files
+ * gamepad_poll.c and gamepad_buttons.c). The Stage 3A code below is
+ * original.
  */
 
 #include "q_shared.h"
@@ -15,13 +39,11 @@
 #include "keycodes.h"
 #include "cl_input.h"
 #include "gamepad.h"
+#include "gamepad_internal.h"   /* gp_state, gp_raw, gp_poll_all, dispatch */
 
 #include <windows.h>
 #include <xinput.h>
 #include <math.h>
-
-// Left/right trigger analog value (0-255) at/above which it counts down.
-#define TRIGGER_THRESHOLD  30
 
 // XInput thumbstick full-scale value.
 #define THUMB_MAX          32767.0f
@@ -50,55 +72,27 @@ static const char *gamepad_accel_curve_names[] =
     NULL
 };
 
-// Per-frame controller tracking for edge detection and transitions.
+// Stage 3A stick-only bookkeeping. The button/trigger fields used in
+// the old gamepadState_t are gone -- gp_state[0] (gamepad_poll.c) owns
+// them now. Only the left-stick directional cache survives, used by
+// Gamepad_ApplyLeftStick below for edge-event generation. This whole
+// block goes away in Phase 3-C when sticks move to usercmd_s.
 typedef struct
 {
-    qboolean connected;     // slot 0 device connected as of the last poll
-    WORD     prev_buttons;  // wButtons from the previous polled frame
-    qboolean prev_lt_down;  // left trigger digital state, previous frame
-    qboolean prev_rt_down;  // right trigger digital state, previous frame
-    BYTE     prev_lt_raw;   // raw left-trigger value, previous frame (debug)
-    BYTE     prev_rt_raw;   // raw right-trigger value, previous frame (debug)
-    qboolean prev_move_fwd;   // left-stick forward state, previous frame
-    qboolean prev_move_back;  // left-stick backward state, previous frame
-    qboolean prev_move_left;  // left-stick strafe-left state, previous frame
-    qboolean prev_move_right; // left-stick strafe-right state, previous frame
-} gamepadState_t;
+    qboolean was_enabled;     // gp_state[0].enabled from the previous frame
+    qboolean prev_move_fwd;
+    qboolean prev_move_back;
+    qboolean prev_move_left;
+    qboolean prev_move_right;
+} gamepadStickState_t;
 
-static gamepadState_t s_gamepad;
-
-// XInput digital button bit -> engine keycode.
-typedef struct
-{
-    WORD mask;
-    int  keycode;
-} gamepadButton_t;
-
-static const gamepadButton_t gamepad_buttons[] =
-{
-    { XINPUT_GAMEPAD_A,              K_JOY1  },
-    { XINPUT_GAMEPAD_B,              K_JOY2  },
-    { XINPUT_GAMEPAD_X,              K_JOY3  },
-    { XINPUT_GAMEPAD_Y,              K_JOY4  },
-    { XINPUT_GAMEPAD_LEFT_SHOULDER,  K_JOY5  },
-    { XINPUT_GAMEPAD_RIGHT_SHOULDER, K_JOY6  },
-    { XINPUT_GAMEPAD_BACK,           K_JOY7  },
-    { XINPUT_GAMEPAD_START,          K_JOY8  },
-    { XINPUT_GAMEPAD_LEFT_THUMB,     K_JOY9  },
-    { XINPUT_GAMEPAD_RIGHT_THUMB,    K_JOY10 },
-    { XINPUT_GAMEPAD_DPAD_UP,        K_JOY11 },
-    { XINPUT_GAMEPAD_DPAD_DOWN,      K_JOY12 },
-    { XINPUT_GAMEPAD_DPAD_LEFT,      K_JOY13 },
-    { XINPUT_GAMEPAD_DPAD_RIGHT,     K_JOY14 },
-};
-
-#define GAMEPAD_BUTTON_COUNT ( sizeof(gamepad_buttons) / sizeof(gamepad_buttons[0]) )
+static gamepadStickState_t s_stick;
 
 /*
 ===========
 IN_StartupGamepads
 
-Registers the controller cvars and resets controller state tracking.
+Registers the controller cvars and resets per-stick state tracking.
 Called once from IN_Startup().
 ===========
 */
@@ -136,16 +130,11 @@ void IN_StartupGamepads(void)
         "cl_gamepad_debug", qfalse, 0,
         "Log raw controller trigger/stick values (temporary diagnostic)");
 
-    s_gamepad.connected = qfalse;
-    s_gamepad.prev_buttons = 0;
-    s_gamepad.prev_lt_down = qfalse;
-    s_gamepad.prev_rt_down = qfalse;
-    s_gamepad.prev_lt_raw = 0;
-    s_gamepad.prev_rt_raw = 0;
-    s_gamepad.prev_move_fwd = qfalse;
-    s_gamepad.prev_move_back = qfalse;
-    s_gamepad.prev_move_left = qfalse;
-    s_gamepad.prev_move_right = qfalse;
+    s_stick.was_enabled    = qfalse;
+    s_stick.prev_move_fwd  = qfalse;
+    s_stick.prev_move_back = qfalse;
+    s_stick.prev_move_left = qfalse;
+    s_stick.prev_move_right = qfalse;
 
     Com_Printf(CON_CHANNEL_SYSTEM, "XInput initialized\n");
 }
@@ -155,59 +144,29 @@ void IN_StartupGamepads(void)
 Gamepad_ReleaseMovement
 
 Sends a release event for any held left-stick movement direction and
-clears the cached states.
+clears the cached states. Called on controller disconnect transitions
+to make sure no arrow key stays stuck "down" in the engine.
+
+Note: button/trigger releases are handled by gp_release_all (see
+gamepad_buttons.c). This function covers only the stick-driven movement
+that still lives in this file until Phase 3-C.
 ===========
 */
 static void Gamepad_ReleaseMovement(void)
 {
-    if ( s_gamepad.prev_move_fwd )
+    if ( s_stick.prev_move_fwd )
         Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_UPARROW, qfalse, 0, NULL );
-    if ( s_gamepad.prev_move_back )
+    if ( s_stick.prev_move_back )
         Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_DOWNARROW, qfalse, 0, NULL );
-    if ( s_gamepad.prev_move_left )
+    if ( s_stick.prev_move_left )
         Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_LEFTARROW, qfalse, 0, NULL );
-    if ( s_gamepad.prev_move_right )
+    if ( s_stick.prev_move_right )
         Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_RIGHTARROW, qfalse, 0, NULL );
 
-    s_gamepad.prev_move_fwd = qfalse;
-    s_gamepad.prev_move_back = qfalse;
-    s_gamepad.prev_move_left = qfalse;
-    s_gamepad.prev_move_right = qfalse;
-}
-
-/*
-===========
-Gamepad_ReleaseAll
-
-Sends a release event for every input currently held -- digital buttons,
-both triggers, and left-stick movement -- then clears all cached states.
-Used on controller disconnect so nothing stays stuck "down" in the engine
-when the pad is unplugged mid-input.
-===========
-*/
-static void Gamepad_ReleaseAll(void)
-{
-    unsigned int i;
-
-    // Digital buttons held in the last polled frame.
-    for ( i = 0; i < GAMEPAD_BUTTON_COUNT; ++i )
-    {
-        if ( s_gamepad.prev_buttons & gamepad_buttons[i].mask )
-            Com_QueueEvent( g_wv.sysMsgTime, SE_KEY,
-                gamepad_buttons[i].keycode, qfalse, 0, NULL );
-    }
-    s_gamepad.prev_buttons = 0;
-
-    // Triggers.
-    if ( s_gamepad.prev_lt_down )
-        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_JOY15, qfalse, 0, NULL );
-    if ( s_gamepad.prev_rt_down )
-        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_JOY16, qfalse, 0, NULL );
-    s_gamepad.prev_lt_down = qfalse;
-    s_gamepad.prev_rt_down = qfalse;
-
-    // Left-stick movement directions.
-    Gamepad_ReleaseMovement();
+    s_stick.prev_move_fwd   = qfalse;
+    s_stick.prev_move_back  = qfalse;
+    s_stick.prev_move_left  = qfalse;
+    s_stick.prev_move_right = qfalse;
 }
 
 /*
@@ -317,145 +276,112 @@ static void Gamepad_ApplyLeftStick(SHORT thumb_lx, SHORT thumb_ly)
     left  = ( lx < -dz );
     right = ( lx >  dz );
 
-    if ( fwd != s_gamepad.prev_move_fwd )
+    if ( fwd != s_stick.prev_move_fwd )
     {
         if ( cl_gamepad_debug->boolean )
             Com_Printf(CON_CHANNEL_SYSTEM,
                 "Stick L: lx=%d ly=%d fwd=%d (was %d) -> K_UPARROW %s\n",
-                thumb_lx, thumb_ly, fwd, s_gamepad.prev_move_fwd,
+                thumb_lx, thumb_ly, fwd, s_stick.prev_move_fwd,
                 fwd ? "pressed" : "released");
         Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_UPARROW, fwd, 0, NULL );
-        s_gamepad.prev_move_fwd = fwd;
+        s_stick.prev_move_fwd = fwd;
     }
-    if ( back != s_gamepad.prev_move_back )
+    if ( back != s_stick.prev_move_back )
     {
         if ( cl_gamepad_debug->boolean )
             Com_Printf(CON_CHANNEL_SYSTEM,
                 "Stick L: lx=%d ly=%d back=%d (was %d) -> K_DOWNARROW %s\n",
-                thumb_lx, thumb_ly, back, s_gamepad.prev_move_back,
+                thumb_lx, thumb_ly, back, s_stick.prev_move_back,
                 back ? "pressed" : "released");
         Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_DOWNARROW, back, 0, NULL );
-        s_gamepad.prev_move_back = back;
+        s_stick.prev_move_back = back;
     }
-    if ( left != s_gamepad.prev_move_left )
+    if ( left != s_stick.prev_move_left )
     {
         if ( cl_gamepad_debug->boolean )
             Com_Printf(CON_CHANNEL_SYSTEM,
                 "Stick L: lx=%d ly=%d left=%d (was %d) -> K_LEFTARROW %s\n",
-                thumb_lx, thumb_ly, left, s_gamepad.prev_move_left,
+                thumb_lx, thumb_ly, left, s_stick.prev_move_left,
                 left ? "pressed" : "released");
         Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_LEFTARROW, left, 0, NULL );
-        s_gamepad.prev_move_left = left;
+        s_stick.prev_move_left = left;
     }
-    if ( right != s_gamepad.prev_move_right )
+    if ( right != s_stick.prev_move_right )
     {
         if ( cl_gamepad_debug->boolean )
             Com_Printf(CON_CHANNEL_SYSTEM,
                 "Stick L: lx=%d ly=%d right=%d (was %d) -> K_RIGHTARROW %s\n",
-                thumb_lx, thumb_ly, right, s_gamepad.prev_move_right,
+                thumb_lx, thumb_ly, right, s_stick.prev_move_right,
                 right ? "pressed" : "released");
         Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_RIGHTARROW, right, 0, NULL );
-        s_gamepad.prev_move_right = right;
+        s_stick.prev_move_right = right;
     }
+}
+
+/*
+===========
+UpdateTheButtonAHint
+
+iw3sp_mod walks the menu list every frame and re-aligns the "BUTTON A"
+hint glyph between PC and console offsets depending on whether a
+gamepad is currently in use. We have no menu integration yet, so this
+is intentionally a no-op for Phase 3-B.
+
+TODO Phase 4 (menu integration): port the alignment loop from
+iw3sp_mod Gamepad.cpp:292-323 once we have a way to walk the
+CoD4x menu tree (uiInfo->uiDC.menuCount).
+===========
+*/
+static void UpdateTheButtonAHint(void)
+{
+    /* intentionally empty -- Phase 4 */
 }
 
 /*
 ===========
 IN_GamepadsMove
 
-Per-frame controller poll. Called from IN_Frame().
+Per-frame controller poll. Called from IN_Frame() (win_input.c). The
+button/trigger pipeline lives in the gp_* state machine
+(gamepad_poll.c + gamepad_buttons.c); the stick pipeline is the
+Stage 3A code above (replaced in Phase 3-C).
 ===========
 */
 void IN_GamepadsMove(void)
 {
-    XINPUT_STATE state;
-    DWORD        result;
-    WORD         changed;
-    unsigned int i;
-    qboolean     lt_down;
-    qboolean     rt_down;
+    qboolean enabled_now;
+
+    UpdateTheButtonAHint();
 
     // Feature guard: zero cost / zero XInput calls when disabled.
     if ( !cl_gamepad->boolean )
         return;
 
-    result = XInputGetState(0, &state);
+    gp_poll_all();
 
-    if ( result != ERROR_SUCCESS )
+    enabled_now = gp_state[0].enabled ? qtrue : qfalse;
+
+    if ( !enabled_now )
     {
-        // Slot 0 empty or device unplugged -- handle silently, no spam.
-        // Release every held input so nothing stays stuck down.
-        if ( s_gamepad.connected )
+        // Pad just unplugged this frame: gp_poll_all already released
+        // the held buttons/triggers via gp_release_all. Release any
+        // held stick movement too so no arrow key stays stuck down.
+        if ( s_stick.was_enabled )
         {
-            s_gamepad.connected = qfalse;
-            Gamepad_ReleaseAll();
-            Com_Printf(CON_CHANNEL_SYSTEM, "Gamepad: disconnected (slot 0)\n");
+            Gamepad_ReleaseMovement();
+            s_stick.was_enabled = qfalse;
         }
         return;
     }
 
-    // Log the disconnected -> connected transition once.
-    if ( !s_gamepad.connected )
-    {
-        s_gamepad.connected = qtrue;
-        s_gamepad.prev_buttons = 0;
-        s_gamepad.prev_lt_down = qfalse;
-        s_gamepad.prev_rt_down = qfalse;
-        s_gamepad.prev_move_fwd = qfalse;
-        s_gamepad.prev_move_back = qfalse;
-        s_gamepad.prev_move_left = qfalse;
-        s_gamepad.prev_move_right = qfalse;
-        Com_Printf(CON_CHANNEL_SYSTEM, "Gamepad: connected (slot 0)\n");
-    }
+    s_stick.was_enabled = qtrue;
 
-    // TEMPORARY drift diagnostic: raw trigger values on change, gated.
-    if ( cl_gamepad_debug->boolean &&
-         ( state.Gamepad.bLeftTrigger  != s_gamepad.prev_lt_raw ||
-           state.Gamepad.bRightTrigger != s_gamepad.prev_rt_raw ) )
-    {
-        Com_Printf(CON_CHANNEL_SYSTEM, "Gamepad debug: LT=%d RT=%d\n",
-            state.Gamepad.bLeftTrigger, state.Gamepad.bRightTrigger);
-    }
-    s_gamepad.prev_lt_raw = state.Gamepad.bLeftTrigger;
-    s_gamepad.prev_rt_raw = state.Gamepad.bRightTrigger;
+    // Buttons + triggers: edge-detected by the state machine, delivered
+    // via Com_QueueEvent (Path A).
+    gp_dispatch_buttons(0);
 
-    // Digital buttons: queue a key event for every bit that changed.
-    changed = state.Gamepad.wButtons ^ s_gamepad.prev_buttons;
-
-    if ( changed )
-    {
-        for ( i = 0; i < GAMEPAD_BUTTON_COUNT; ++i )
-        {
-            if ( changed & gamepad_buttons[i].mask )
-            {
-                qboolean down =
-                    ( state.Gamepad.wButtons & gamepad_buttons[i].mask ) != 0;
-
-                Com_QueueEvent( g_wv.sysMsgTime, SE_KEY,
-                    gamepad_buttons[i].keycode, down, 0, NULL );
-            }
-        }
-    }
-
-    s_gamepad.prev_buttons = state.Gamepad.wButtons;
-
-    // Triggers: analog 0-255, treated as digital buttons via a threshold.
-    lt_down = ( state.Gamepad.bLeftTrigger  > TRIGGER_THRESHOLD );
-    rt_down = ( state.Gamepad.bRightTrigger > TRIGGER_THRESHOLD );
-
-    if ( lt_down != s_gamepad.prev_lt_down )
-    {
-        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_JOY15, lt_down, 0, NULL );
-        s_gamepad.prev_lt_down = lt_down;
-    }
-
-    if ( rt_down != s_gamepad.prev_rt_down )
-    {
-        Com_QueueEvent( g_wv.sysMsgTime, SE_KEY, K_JOY16, rt_down, 0, NULL );
-        s_gamepad.prev_rt_down = rt_down;
-    }
-
-    // Analog sticks.
-    Gamepad_ApplyRightStick( state.Gamepad.sThumbRX, state.Gamepad.sThumbRY );
-    Gamepad_ApplyLeftStick(  state.Gamepad.sThumbLX, state.Gamepad.sThumbLY );
+    // Sticks: Stage 3A code, reading the raw XINPUT state cached by
+    // the poller. To be replaced by the usercmd_s path in Phase 3-C.
+    Gamepad_ApplyRightStick( gp_raw[0].sThumbRX, gp_raw[0].sThumbRY );
+    Gamepad_ApplyLeftStick(  gp_raw[0].sThumbLX, gp_raw[0].sThumbLY );
 }
