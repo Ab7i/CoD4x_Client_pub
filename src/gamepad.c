@@ -53,11 +53,17 @@
 #define GAMEPAD_LOOK_SCALE 12.0f
 
 // Controller settings. All CVAR_ARCHIVE so they persist to config_mp.cfg.
-static cvar_t *cl_gamepad;
-static cvar_t *cl_gamepad_sens_look;
+// Four cvars are shared with gamepad_move.c (Phase 3-C) and thus
+// non-static; their `extern` declarations live in gamepad_internal.h.
+cvar_t *cl_gamepad;
+cvar_t *cl_gamepad_sens_look;
+cvar_t *cl_gamepad_deadzone_left;
+cvar_t *cl_gamepad_deadzone_right;
+cvar_t *cl_gamepad_legacy_sticks;   // Phase 3-C: 1 = Stage 3A path, 0 = new usercmd path
+cvar_t *cl_gamepad_invert_pitch;    // Phase 3-C: inverts pitchmove in the usercmd path
+
+// gamepad.c-internal cvars (only read in this TU).
 static cvar_t *cl_gamepad_sens_ads;
-static cvar_t *cl_gamepad_deadzone_left;
-static cvar_t *cl_gamepad_deadzone_right;
 static cvar_t *cl_gamepad_invert_y;
 static cvar_t *cl_gamepad_accel_curve;
 
@@ -129,6 +135,22 @@ void IN_StartupGamepads(void)
     cl_gamepad_debug = Cvar_RegisterBool(
         "cl_gamepad_debug", qfalse, 0,
         "Log raw controller trigger/stick values (temporary diagnostic)");
+
+    // Phase 3-C cvars (NOT YET active -- the usercmd hook is installed
+    // in Phase 3-C.4 in a follow-up commit. Defaults are picked so the
+    // Stage 3A behavior remains the user-visible path until the new
+    // path is live + smoke-tested).
+    cl_gamepad_legacy_sticks = Cvar_RegisterBool(
+        "cl_gamepad_legacy_sticks", qtrue, CVAR_ARCHIVE,
+        "Use Stage 3A stick handling (CL_MouseEvent + arrow keys). "
+        "Set to 0 to enable the Phase 3-C analog usercmd path "
+        "(requires the IN_GamepadsMove hook to be installed)");
+
+    cl_gamepad_invert_pitch = Cvar_RegisterBool(
+        "cl_gamepad_invert_pitch", qfalse, CVAR_ARCHIVE,
+        "Invert the controller pitch axis in the Phase 3-C usercmd path "
+        "(independent of cl_gamepad_invert_y which is the Stage 3A "
+        "CL_MouseEvent-layer toggle)");
 
     s_stick.was_enabled    = qfalse;
     s_stick.prev_move_fwd  = qfalse;

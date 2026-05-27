@@ -64,6 +64,7 @@ add_library(cod4x SHARED
     src/gamepad.c
     src/gamepad_poll.c
     src/gamepad_buttons.c
+    src/gamepad_move.c
     src/win_wndproc.c
     src/win_syscon.c
     src/win_sys.c

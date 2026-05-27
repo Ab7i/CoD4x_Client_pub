@@ -31,6 +31,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Forward declaration so we can declare `extern cvar_t *...` below
+ * without pulling all of q_shared.h into every TU that wants the
+ * gamepad types. The full struct lives in cvar.h / q_shared.h and
+ * is included by gamepad.c and gamepad_move.c via q_shared.h. */
+struct cvar_s;
+typedef struct cvar_s cvar_t;
+
 /* ===================================================================
  * 1. Counts
  * =================================================================== */
@@ -199,6 +206,11 @@ typedef struct {
 } gp_virtual_axis_t;
 
 typedef struct {
+    /* Polled physical-axis deflections in [-1..1], populated each frame
+     * by gp_populate_axes() (defined in gamepad_move.c). Field order
+     * matches iw3sp_mod's Game::GpadAxesGlob::axesValues -- index with
+     * gp_phys_axis_e values (RSTICK_X..LTRIGGER). */
+    float axesValues[GP_PHYSAXIS_COUNT];
     gp_virtual_axis_t virtualAxes[GP_VIRTAXIS_COUNT];
 } gp_axes_glob_t;
 
@@ -229,6 +241,47 @@ typedef struct {
     gp_axes_glob_t axes;
     unsigned       nextScrollTime;
 } gp_globals_t;
+
+/* ===================================================================
+ * 5b. Engine usercmd_t -- mirror of iw3sp_mod's Game::usercmd_s
+ *
+ *   CoD4x's q_shared.h declares an incomplete `usercmd_t` (it names
+ *   only field_16/17/18/1C as placeholders for the movement bytes).
+ *   The engine's actual struct is the layout below; Stage 2 verified
+ *   byte-identity vs iw3sp_mod's CL_MouseMove.
+ *
+ *   Phase 3-C casts CoD4x's `usercmd_t*` to `gp_usercmd_t*` inside
+ *   our hook target so we can write the named fields directly without
+ *   touching q_shared.h (which is shared by many TUs).
+ *
+ *   The pragma pack(1) matches CoD4x's q_shared.h pack; the iw3sp_mod
+ *   layout naturally lacks padding between the char block and gunPitch
+ *   because pitchmove+yawmove sit on a 4-byte boundary anyway, so the
+ *   two layouts are byte-identical.
+ * =================================================================== */
+
+#pragma pack(push, 1)
+typedef struct {
+    int   serverTime;
+    int   buttons;
+    int   angles[3];
+    char  weapon;
+    char  offHandIndex;
+    char  forwardmove;
+    char  rightmove;
+    char  upmove;
+    char  pitchmove;
+    char  yawmove;
+    float gunPitch;
+    float gunYaw;
+    float gunXOfs;
+    float gunYOfs;
+    float gunZOfs;
+    float meleeChargeYaw;
+    char  meleeChargeDist;
+    char  selectedLocation[2];
+} gp_usercmd_t;
+#pragma pack(pop)
 
 typedef struct {
     const char *buttonA;
@@ -338,5 +391,51 @@ void gp_dispatch_buttons(int port);
  * lastAnalogs. Called on disconnect transition so the engine doesn't
  * see a frozen "down" key. */
 void gp_release_all(int port);
+
+/* ===================================================================
+ * 9. Phase 3-C movement API (defined in gamepad_move.c)
+ *
+ *   `gp_globals[0].axes.axesValues[]` is the canonical per-frame
+ *   deflection table that CL_GamepadAxisValue reads through. It is
+ *   populated by gp_populate_axes() before each CL_GamepadMove call.
+ *
+ *   `gp_cl_mousemove` is the hook target installed at iw3mp
+ *   0x463D70 in Phase 3-C.4 (NOT installed yet -- this file declares
+ *   the function so gamepad_move.c can compile without callers).
+ * =================================================================== */
+
+extern gp_globals_t gp_globals[GP_MAX_GPAD_COUNT];
+
+/* Copy gp_state[port].sticks[] + analogs[] into gp_globals[port]
+ * .axes.axesValues[], applying the standard stick deadzone from
+ * cl_gamepad_deadzone_{left,right}. Caller: gp_cl_gamepadmove. */
+void gp_populate_axes(int port);
+
+/* Phase 3-C.4 hook target -- replaces the engine's CALL CL_MouseMove
+ * at iw3mp 0x463D70 (HOOK_JUMP). Either falls through to the original
+ * CL_MouseMove (mouse path) or routes to gp_cl_gamepadmove
+ * (gamepad path). __cdecl: pre-flight DumpCallSite verified the
+ * engine adds ESP,4 after the call. */
+void __cdecl gp_cl_mousemove(gp_usercmd_t *cmd);
+
+/* Phase 3-C movement writer: reads gp_globals[0].axes.axesValues[]
+ * via CL_GamepadAxisValue, applies sensitivity + move scale, writes
+ * cmd->{forwardmove,rightmove,pitchmove,yawmove}. No aim assist
+ * (deferred to Stage 3-D). */
+void gp_cl_gamepadmove(gp_usercmd_t *cmd);
+
+/* ===================================================================
+ * 10. Phase 3-C cvars shared with gamepad_move.c
+ *
+ *   Defined in gamepad.c. Made non-static so gamepad_move.c can read
+ *   them without going through Cvar_FindVar each frame.
+ * =================================================================== */
+
+extern cvar_t *cl_gamepad;
+extern cvar_t *cl_gamepad_sens_look;
+extern cvar_t *cl_gamepad_deadzone_left;
+extern cvar_t *cl_gamepad_deadzone_right;
+extern cvar_t *cl_gamepad_legacy_sticks;   /* new in 3-C */
+extern cvar_t *cl_gamepad_invert_pitch;    /* new in 3-C */
 
 #endif /* __GAMEPAD_INTERNAL_H__ */
