@@ -27,3 +27,11 @@
 void SetCall(DWORD addr, void* destination);
 void SetJump(DWORD addr, void* destination);
 void WriteSymbol(DWORD addr, void* symbol);
+
+/* Stage 3-A (gamepad port): overwrite a pointer-sized value at `addr`
+ * with `value`. Unlike WriteSymbol, this function self-unprotects the
+ * destination page (PAGE_EXECUTE_READWRITE) for the duration of the
+ * write and then restores the original protection, matching the
+ * semantics of iw3sp_mod's Utils::Hook::Set<T*>. Safe to call from
+ * anywhere; no external VirtualProtect bracketing required. */
+void Patch_SetPtr(DWORD addr, void* value);

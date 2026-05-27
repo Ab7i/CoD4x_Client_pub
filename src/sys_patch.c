@@ -35,6 +35,22 @@ void Patch_Memset(void * ptr, int value, size_t num)
 	memset(ptr, value, num);
 }
 
+/* Stage 3-A (gamepad port): self-unprotecting pointer overwrite,
+ * matching iw3sp_mod's Utils::Hook::Set<T*>. See sys_patch.h. */
+void Patch_SetPtr(DWORD addr, void* value)
+{
+	DWORD oldProtect;
+	void* place = (void*)addr;
+
+	if (VirtualProtect(place, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect) == 0)
+		return;
+
+	*(void**)place = value;
+
+	VirtualProtect(place, sizeof(void*), oldProtect, &oldProtect);
+	FlushInstructionCache(GetCurrentProcess(), place, sizeof(void*));
+}
+
 
 void Sys_PatchImageWithBlock(byte *block, int blocksize)
 {
