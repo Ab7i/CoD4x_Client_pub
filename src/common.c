@@ -5,6 +5,7 @@
 #include "win_sys.h"
 #include "ui_shared.h"
 #include "cl_input.h"
+#include "gamepad.h"   /* Phase 3-E.1: gp_cl_keyevent (SE_KEY wrapper) */
 
 #include <stdarg.h>
 #include <stdlib.h>
@@ -469,7 +470,10 @@ int Com_EventLoop( void ) {
 				return ev.evTime;
 
 			case SE_KEY:
-				CL_KeyEvent( 0, ev.evValue, ev.evValue2, ev.evTime );
+				/* Phase 3-E.1: route through the gamepad wrapper, which
+				 * clears controller-in-use on keyboard/mouse keys then
+				 * forwards to the engine CL_KeyEvent. */
+				gp_cl_keyevent( 0, ev.evValue, ev.evValue2, ev.evTime );
 				break;
 
 			case SE_CHAR:

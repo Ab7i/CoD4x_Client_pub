@@ -424,3 +424,57 @@ void IN_GamepadsMove(void)
     if ( cl_gamepad_legacy_sticks->boolean )
         Gamepad_ApplyLeftStick( gp_raw[0].sThumbLX, gp_raw[0].sThumbLY );
 }
+
+/*
+===========
+gp_cl_keyevent
+
+Phase 3-E.1: SE_KEY dispatch wrapper, installed at Com_EventLoop's
+SE_KEY case (common.c) in place of the engine CL_KeyEvent. iw3sp_mod
+hooks the engine key router (CL_KeyEvent_Hk @ iw3mp 0x4FDCBF) for this,
+but that router is SUPERSEDED in CoD4x -- Com_EventLoop owns the key
+loop and calls the engine CL_KeyEvent directly. So we wrap it here
+instead (same pattern as IN_Frame in Phase 3-C).
+
+Purpose: when a keyboard/mouse key is pressed, clear the controller
+in-use flag so the game leaves controller mode. Our own gamepad buttons
+travel the SAME Com_QueueEvent path as K_JOY1..K_JOY16 (Path A), so we
+must NOT clear inUse for them -- they are what SET it in
+gp_dispatch_buttons.
+
+CL_KeyEvent is __cdecl (verified: iw3mp 0x467EB0 reads all args from
+the stack; call site 0x4FDCBF cleans 16 bytes for 4 args).
+===========
+*/
+void __cdecl gp_cl_keyevent(int localClientNum, int key, int down, unsigned time)
+{
+    /* Optional one-shot diagnostics, gated behind cl_gamepad_debug, kept
+     * minimal for future bring-up (no per-event spam). */
+    static int once_kb = 0;
+    static int once_pad = 0;
+
+    if ( key < K_JOY1 || key > K_JOY16 )
+    {
+        // Keyboard / mouse / other key -> leave controller mode.
+        gp_state[0].inUse = false;
+
+        if ( !once_kb && cl_gamepad_debug && cl_gamepad_debug->boolean )
+        {
+            once_kb = 1;
+            Com_Printf(CON_CHANNEL_SYSTEM,
+                "[gp] inUse=false (keyboard/mouse, key=%d)\n", key);
+        }
+    }
+    else
+    {
+        // Gamepad button (K_JOY1..16) -> pass through, inUse unchanged.
+        if ( !once_pad && cl_gamepad_debug && cl_gamepad_debug->boolean )
+        {
+            once_pad = 1;
+            Com_Printf(CON_CHANNEL_SYSTEM,
+                "[gp] gamepad key passthrough (key=%d, inUse unchanged)\n", key);
+        }
+    }
+
+    CL_KeyEvent( localClientNum, key, down, time );
+}
