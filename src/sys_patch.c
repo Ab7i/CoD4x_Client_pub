@@ -51,6 +51,32 @@ void Patch_SetPtr(DWORD addr, void* value)
 	FlushInstructionCache(GetCurrentProcess(), place, sizeof(void*));
 }
 
+/* Phase 3-C.4 (gamepad port): self-unprotecting variants of SetCall /
+ * SetJump. The raw SetCall/SetJump write directly into .text and assume
+ * the caller already unprotected the page (CoD4x's own patches run
+ * inside Patch_MainModule's VirtualProtect window). Our gamepad hooks
+ * install from IN_StartupGamepads -- OUTSIDE that window -- so they must
+ * unprotect the 5-byte patch site themselves. See sys_patch.h. */
+void Patch_SetCall(DWORD addr, void* destination)
+{
+	DWORD oldProtect;
+	if (VirtualProtect((void*)addr, 5, PAGE_EXECUTE_READWRITE, &oldProtect) == 0)
+		return;
+	SetCall(addr, destination);
+	VirtualProtect((void*)addr, 5, oldProtect, &oldProtect);
+	FlushInstructionCache(GetCurrentProcess(), (void*)addr, 5);
+}
+
+void Patch_SetJump(DWORD addr, void* destination)
+{
+	DWORD oldProtect;
+	if (VirtualProtect((void*)addr, 5, PAGE_EXECUTE_READWRITE, &oldProtect) == 0)
+		return;
+	SetJump(addr, destination);
+	VirtualProtect((void*)addr, 5, oldProtect, &oldProtect);
+	FlushInstructionCache(GetCurrentProcess(), (void*)addr, 5);
+}
+
 
 void Sys_PatchImageWithBlock(byte *block, int blocksize)
 {

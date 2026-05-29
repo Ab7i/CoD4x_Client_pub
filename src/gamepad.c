@@ -40,6 +40,7 @@
 #include "cl_input.h"
 #include "gamepad.h"
 #include "gamepad_internal.h"   /* gp_state, gp_raw, gp_poll_all, dispatch */
+#include "gamepad_hooks.h"      /* GP_HOOK_CALL */
 
 #include <windows.h>
 #include <xinput.h>
@@ -157,6 +158,13 @@ void IN_StartupGamepads(void)
     s_stick.prev_move_back = qfalse;
     s_stick.prev_move_left = qfalse;
     s_stick.prev_move_right = qfalse;
+
+    /* Phase 3-C.4: redirect engine's CL_MouseMove call site (0x463D70,
+     * originally CALL 0x463490) to our dispatcher. We use GP_HOOK_CALL
+     * (not JMP) because the original instruction is a CALL -- the engine
+     * pushes `cmd` and expects cdecl return semantics. gp_cl_mousemove
+     * stays dormant until cl_gamepad_legacy_sticks==0 (default==1). */
+    GP_HOOK_CALL(IW3MP_CL_MOUSEMOVE_STUB_JMP, gp_cl_mousemove);
 
     Com_Printf(CON_CHANNEL_SYSTEM, "XInput initialized\n");
 }
@@ -402,8 +410,17 @@ void IN_GamepadsMove(void)
     // via Com_QueueEvent (Path A).
     gp_dispatch_buttons(0);
 
-    // Sticks: Stage 3A code, reading the raw XINPUT state cached by
-    // the poller. To be replaced by the usercmd_s path in Phase 3-C.
+    // Right stick -> view. ALWAYS active: it feeds the CL_MouseEvent
+    // accumulator that the engine CL_MouseMove consumes. In Phase 3-C's
+    // hybrid (Option A) this is the look source in BOTH modes -- at
+    // legacy=0 the gamepad dispatcher (gp_cl_mousemove) still calls the
+    // original CL_MouseMove, so this accumulator is what rotates the view.
     Gamepad_ApplyRightStick( gp_raw[0].sThumbRX, gp_raw[0].sThumbRY );
-    Gamepad_ApplyLeftStick(  gp_raw[0].sThumbLX, gp_raw[0].sThumbLY );
+
+    // Left stick -> movement. At legacy=1 (Stage 3A) it fires arrow-key
+    // events here. At legacy=0 the Phase 3-C usercmd path
+    // (gp_cl_gamepadmove) writes forwardmove/rightmove instead, so we
+    // must NOT also fire arrow keys -- that would double-apply movement.
+    if ( cl_gamepad_legacy_sticks->boolean )
+        Gamepad_ApplyLeftStick( gp_raw[0].sThumbLX, gp_raw[0].sThumbLY );
 }

@@ -339,6 +339,14 @@ typedef struct {
 #define IW3MP_KEY_SETBIND_JMP_1        0x5529B8u             /* Gamepad.cpp:2325 */
 #define IW3MP_KEY_SETBIND_JMP_2        0x5529CBu             /* Gamepad.cpp:2326 */
 #define IW3MP_KEY_SETBIND_JMP_3        0x5529E3u             /* Gamepad.cpp:2327 */
+/* NOTE: the "_JMP" suffix is historical (iw3sp_mod installs a HOOK_JUMP
+ * + naked trampoline here). In CoD4x we install with GP_HOOK_CALL
+ * instead -- the original instruction at 0x463D70 is `CALL 0x463490`,
+ * so replacing the call target with our gp_cl_mousemove keeps the
+ * push/return/ADD-ESP,4 semantics intact without a trampoline. Note
+ * gp_cl_mousemove is regparm(1) (NOT __cdecl) because CL_MouseMove is
+ * __usercall -- see the convention note on gp_cl_mousemove below. The
+ * address (0x463D70) is correct; only the mechanism name differs. */
 #define IW3MP_CL_MOUSEMOVE_STUB_JMP    0x463D70u             /* Gamepad.cpp:2330 -- call-CL_MouseMove site inside its host 0x463D10 */
 
 /* --- not yet resolved (Stage 3.5) ---
@@ -412,11 +420,32 @@ extern gp_globals_t gp_globals[GP_MAX_GPAD_COUNT];
 void gp_populate_axes(int port);
 
 /* Phase 3-C.4 hook target -- replaces the engine's CALL CL_MouseMove
- * at iw3mp 0x463D70 (HOOK_JUMP). Either falls through to the original
- * CL_MouseMove (mouse path) or routes to gp_cl_gamepadmove
- * (gamepad path). __cdecl: pre-flight DumpCallSite verified the
- * engine adds ESP,4 after the call. */
-void __cdecl gp_cl_mousemove(gp_usercmd_t *cmd);
+ * at iw3mp 0x463D70 (installed via GP_HOOK_CALL).
+ *
+ * CRITICAL CONVENTION: iw3mp's CL_MouseMove is __usercall, NOT __cdecl.
+ * Disassembly of the call site (0x463D70) and the function entry
+ * (0x463490) proves:
+ *     0x463D6D: PUSH EDI        ; arg2 = cmd  (on the stack)
+ *     0x463D6E: MOV  EAX, ESI   ; arg1 = client  (in EAX)
+ *     0x463D70: CALL 0x463490
+ *     0x463490: ... MOV EDI, EAX     ; reads EAX (client) at entry
+ *               ... MOV EBX,[ESP+..] ; reads the stack arg (cmd)
+ *     0x463D7D: ADD ESP, 4      ; caller cleans the 1 stack arg
+ * i.e. first arg in EAX, second on the stack, caller-cleaned. That is
+ * exactly GCC's regparm(1) cdecl-style convention. The MP build needs
+ * the client arg (localClientNum) that SP did not -- which is why
+ * iw3sp_mod's __cdecl(usercmd_s*) port worked there but crashes in MP.
+ *
+ * The earlier __cdecl hook clobbered EAX, so when we forwarded to the
+ * original CL_MouseMove it received a garbage client index, computed a
+ * wild pointer (IMUL EDI,0x258 ; CMP [EDI+0xB0]) and faulted at
+ * 0x4635CB -- only on the movement code path (non-zero delta), which is
+ * why it crashed "only when moving". (Verified: 0x463490 has exactly
+ * ONE caller, 0x463D70, and it always loads EAX=ESI.)
+ *
+ * Declared regparm(1): arg1 (client) arrives in EAX, arg2 (cmd) on the
+ * stack. */
+void __attribute__((regparm(1))) gp_cl_mousemove(int client, gp_usercmd_t *cmd);
 
 /* Phase 3-C movement writer: reads gp_globals[0].axes.axesValues[]
  * via CL_GamepadAxisValue, applies sensitivity + move scale, writes

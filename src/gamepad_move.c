@@ -209,18 +209,26 @@ static float gp_axis_value(int port, gp_virt_axis_e virt)
  * Movement writer (the heart of Phase 3-C)
  * =================================================================== */
 
-/* Mirrors iw3sp_mod CL_GamepadMove (Gamepad.cpp:894), **WITHOUT** the
- * aim-assist branch (lines 931-954). That branch reads engine
- * clients[0] + AimInput/AimOutput, which is Stage 3-D Path-B work.
+/* Mirrors iw3sp_mod CL_GamepadMove (Gamepad.cpp:894), **MOVEMENT ONLY**.
  *
- *   Phase 3-C scope: write the four signed-char fields on `cmd`.
- *   Engine `PM_*` does the rest. */
+ * Phase 3-C is hybrid (Option A): the LEFT stick drives analog movement
+ * here (forwardmove/rightmove); the RIGHT stick (look) is handled by the
+ * engine's own CL_MouseMove, which consumes the CL_MouseEvent accumulator
+ * fed by Gamepad_ApplyRightStick (Stage 3A path). The dispatcher
+ * (gp_cl_mousemove) calls the original CL_MouseMove for the look, then
+ * this function for the movement.
+ *
+ * pitchmove/yawmove are NOT written here: in iw3sp_mod the actual view
+ * rotation comes from the aim-assist/turn-rate branch writing
+ * clientActive.viewangles -- which is deferred to Stage 3-D. Writing
+ * pitchmove/yawmove alone does not rotate the view and would only
+ * conflict with the CL_MouseMove look path. They return in Stage 3-D
+ * when we port the turn-rate code and switch to usercmd-native look. */
 void gp_cl_gamepadmove(gp_usercmd_t *cmd)
 {
-    float pitch, yaw, forward, side;
+    float forward, side;
     float move_scale;
-    int   forward_move, right_move, pitch_move, yaw_move;
-    float sens_scale;
+    int   forward_move, right_move;
 
     if (!cmd)
         return;
@@ -230,20 +238,8 @@ void gp_cl_gamepadmove(gp_usercmd_t *cmd)
     /* Refresh the axesValues[] table from gp_state for THIS frame. */
     gp_populate_axes(0);
 
-    pitch   = gp_axis_value(0, GPAD_VIRTAXIS_PITCH);
-    if (!(cl_gamepad_invert_pitch && cl_gamepad_invert_pitch->boolean))
-        pitch *= -1.0f;            /* stick-up -> negative pitch (look up) */
-
-    yaw     = -gp_axis_value(0, GPAD_VIRTAXIS_YAW);
     forward =  gp_axis_value(0, GPAD_VIRTAXIS_FORWARD);
     side    =  gp_axis_value(0, GPAD_VIRTAXIS_SIDE);
-
-    /* Sensitivity multiplier applied to the look axes only. Movement
-     * doesn't get scaled -- the engine's PM_* already speeds up the
-     * player based on forwardmove magnitude. */
-    sens_scale = (cl_gamepad_sens_look ? cl_gamepad_sens_look->floatval : 1.0f);
-    pitch *= sens_scale;
-    yaw   *= sens_scale;
 
     /* iw3sp_mod's diagonal-normalize trick (Gamepad.cpp:912-918). When
      * both movement axes are deflected, scale up so the combined
@@ -259,16 +255,13 @@ void gp_cl_gamepadmove(gp_usercmd_t *cmd)
 
     forward_move = (int)floorf(forward * move_scale);
     right_move   = (int)floorf(side    * move_scale);
-    pitch_move   = (int)floorf(pitch   * move_scale);
-    yaw_move     = (int)floorf(yaw     * move_scale);
 
     cmd->rightmove   = gp_clamp_char((int)cmd->rightmove   + right_move);
     cmd->forwardmove = gp_clamp_char((int)cmd->forwardmove + forward_move);
-    cmd->pitchmove   = gp_clamp_char((int)cmd->pitchmove   + pitch_move);
-    cmd->yawmove     = gp_clamp_char((int)cmd->yawmove     + yaw_move);
 
-    /* Aim-assist block from iw3sp_mod Gamepad.cpp:931-954 is
-     * intentionally omitted -- deferred to Stage 3-D. */
+    /* pitchmove/yawmove (look) deferred to Stage 3-D (AimAssist port +
+     * clientActive.viewangles turn-rate). Right-stick look is provided
+     * in Phase 3-C by the engine CL_MouseMove path (see dispatcher). */
 }
 
 /* ===================================================================
@@ -283,15 +276,22 @@ void gp_cl_gamepadmove(gp_usercmd_t *cmd)
  *   verified by DumpCallSite.java pre-flight, Phase 3-C.3).
  * =================================================================== */
 
-typedef void (__cdecl *gp_cl_mousemove_engine_fn)(gp_usercmd_t *cmd);
+/* iw3mp CL_MouseMove is __usercall: arg1 (client) in EAX, arg2 (cmd) on
+ * the stack, caller-cleaned. regparm(1) models this exactly. See the
+ * big convention note in gamepad_internal.h. */
+typedef void (__attribute__((regparm(1))) *gp_cl_mousemove_engine_fn)(int client, gp_usercmd_t *cmd);
 
-void __cdecl gp_cl_mousemove(gp_usercmd_t *cmd)
+void __attribute__((regparm(1))) gp_cl_mousemove(int client, gp_usercmd_t *cmd)
 {
     /* When cl_gamepad is OFF, OR the pad isn't currently in use, OR
      * the legacy stick path is selected: defer to engine mouse code.
      * This keeps the mouse path intact for keyboard+mouse users and
      * keeps Stage 3A's CL_MouseEvent path working unchanged when
-     * cl_gamepad_legacy_sticks == 1. */
+     * cl_gamepad_legacy_sticks == 1.
+     *
+     * MUST forward `client` in EAX (regparm(1)) -- the original
+     * CL_MouseMove indexes the client array by it (IMUL ...,0x258).
+     * Passing a clobbered EAX was the Phase 3-C.4 crash. */
     qboolean want_gamepad =
         (cl_gamepad && cl_gamepad->boolean) &&
         gp_state[0].enabled &&
@@ -300,12 +300,22 @@ void __cdecl gp_cl_mousemove(gp_usercmd_t *cmd)
 
     if (!want_gamepad)
     {
-        ((gp_cl_mousemove_engine_fn)IW3MP_CL_MOUSEMOVE_FN)(cmd);
+        /* Mouse user (or gamepad disabled / legacy path): original look only. */
+        ((gp_cl_mousemove_engine_fn)IW3MP_CL_MOUSEMOVE_FN)(client, cmd);
         return;
     }
 
-    /* Skip when the in-game console catcher is active -- otherwise
-     * stick input keeps moving the player while the user is typing.
+    /* Gamepad path (Option A hybrid):
+     *  1. Run the ORIGINAL CL_MouseMove first -- it consumes the
+     *     CL_MouseEvent accumulator that Gamepad_ApplyRightStick fed
+     *     from the right stick, rotating the view (same proven Stage 3A
+     *     look path). EAX=client preserved via regparm(1).
+     *  2. Then inject analog movement (forwardmove/rightmove) LAST so
+     *     CL_MouseMove cannot overwrite it. */
+    ((gp_cl_mousemove_engine_fn)IW3MP_CL_MOUSEMOVE_FN)(client, cmd);
+
+    /* Skip movement injection when the in-game console catcher is active
+     * -- otherwise the stick keeps moving the player while typing.
      * Matches iw3sp_mod's Key_IsCatcherActive(KEYCATCH_CONSOLE) guard. */
     if (Key_IsCatcherActive(0, KEYCATCH_CONSOLE))
         return;

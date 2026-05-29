@@ -35,3 +35,13 @@ void WriteSymbol(DWORD addr, void* symbol);
  * semantics of iw3sp_mod's Utils::Hook::Set<T*>. Safe to call from
  * anywhere; no external VirtualProtect bracketing required. */
 void Patch_SetPtr(DWORD addr, void* value);
+
+/* Phase 3-C.4 (gamepad port): self-unprotecting variants of SetCall /
+ * SetJump. The raw SetCall/SetJump assume the caller already unprotected
+ * the .text page (true for CoD4x's own patches, which run inside
+ * Patch_MainModule's VirtualProtect window). These wrappers unprotect
+ * the 5-byte patch site themselves, so they are safe to call from
+ * anywhere -- e.g. the gamepad hooks installed from IN_StartupGamepads,
+ * which runs OUTSIDE any unprotect window. */
+void Patch_SetCall(DWORD addr, void* destination);
+void Patch_SetJump(DWORD addr, void* destination);
