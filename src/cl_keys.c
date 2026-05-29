@@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "keys.h"
 #include "cl_input.h"
 #include "client.h"
+#include "gamepad.h"   /* Phase 3-E.2: gp_keynum_to_name fallback */
 #include <ctype.h>
 
 /*
@@ -105,6 +106,16 @@ const char *Key_KeynumToString( int keynum, qboolean bTranslate ) {
 	for ( ; kn->name ; kn++ ) {
 		if ( keynum == kn->keynum ) {
 			return kn->name;
+		}
+	}
+
+	// Phase 3-E.2: gamepad button names (BUTTON_A, DPAD_UP, ...) are not
+	// in the stock table this function reads, so fall back to the
+	// gamepad keyName map before producing a hex string.
+	{
+		const char *gpName = gp_keynum_to_name( keynum );
+		if ( gpName ) {
+			return gpName;
 		}
 	}
 

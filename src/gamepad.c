@@ -166,6 +166,11 @@ void IN_StartupGamepads(void)
      * stays dormant until cl_gamepad_legacy_sticks==0 (default==1). */
     GP_HOOK_CALL(IW3MP_CL_MOUSEMOVE_STUB_JMP, gp_cl_mousemove);
 
+    // Phase 3-E.2: extend the engine keyName table with the controller
+    // button names (BUTTON_A, DPAD_UP, ...) so `bind <name>` resolves
+    // them. Idempotent across in_restart.
+    gp_install_keynames();
+
     Com_Printf(CON_CHANNEL_SYSTEM, "XInput initialized\n");
 }
 
