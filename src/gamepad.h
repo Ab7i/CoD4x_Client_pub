@@ -28,4 +28,17 @@ void gp_install_keynames(void);
 // keynums, or NULL if `keynum` is not a gamepad button.
 const char *gp_keynum_to_name(int keynum);
 
+// Phase 3-E.3: install the binding engine hooks (Key_GetCommandAssignment
+// entry replacement via naked trampoline). Called from IN_StartupGamepads
+// after gp_install_keynames. Idempotent.
+void gp_install_bindhooks(void);
+
+// Phase 3-E.3: gamepad-aware command->key lookup (engine entry
+// replacement target, called from gamepad_stubs.asm). __cdecl.
+int __cdecl gp_key_getcmdassign(int localClientNum, const char *command, int *keys);
+
+// Phase 3-E.3 helpers (exposed for reuse / testing).
+const char *gp_get_gamepad_command(const char *command);
+qboolean    gp_key_is_valid_gamepad_char(int key);
+
 #endif // __GAMEPAD_H__

@@ -32,8 +32,11 @@
 
 #include "q_shared.h"
 #include "qcommon.h"
-#include "gamepad_internal.h"   /* gp_keyname_t, GAME_K_* */
-#include "gamepad_hooks.h"      /* GP_HOOK_SET_PTR -> Patch_SetPtr */
+#include "keys.h"               /* playerKeys (0x8F1CA0), qkey_t.binding */
+#include "gamepad_internal.h"   /* gp_keyname_t, GAME_K_*, IW3MP_KEY_GETCMDASSIGN_JMP */
+#include "gamepad_hooks.h"      /* GP_HOOK_SET_PTR, GP_HOOK_JUMP */
+
+#include <string.h>             /* strcmp */
 
 /* Stock english keyName table in iw3mp (.data). 95 entries + null,
  * confirmed by DumpKeynameSites.java. */
@@ -154,4 +157,126 @@ const char *gp_keynum_to_name(int keynum)
             return gp_extended_keynames[i].name;
     }
     return NULL;
+}
+
+/* ===================================================================
+ * Phase 3-E.3: Key_GetCommandAssignmentInternal (engine 0x4678E0)
+ *
+ * The engine's "which key is bound to command X" lookup, made
+ * gamepad-aware (iw3sp_mod Gamepad.cpp:1003). Installed as a full
+ * entry-replacement via a naked trampoline (gamepad_stubs.asm) ->
+ * __usercall arg1 (localClientNum) marshalled to this __cdecl fn.
+ *
+ * Reads the engine playerKeys exposed by CoD4x keys.h
+ * (#define playerKeys (*((PlayerKeyState_t*)0x8F1CA0))), so NO new
+ * engine-ABI reverse-engineering. MAX_LOCAL_CLIENTS==1 -> localClientNum
+ * is always 0; the single playerKeys instance suffices.
+ *
+ * NOTE (keynum space): this operates on ENGINE keynums (BUTTON_A=0x1 ..
+ * DPAD_RIGHT=0x17), matching the 3-E.2 keyName table and iw3sp_mod --
+ * NOT the K_JOY1..16 that Path A currently emits. Until the input path
+ * migrates from K_JOY to engine gamepad keynums, bindings made on
+ * BUTTON_* won't fire from physical presses; this function is the
+ * lookup foundation for that migration.
+ * =================================================================== */
+
+#define GP_K_LAST_KEY  0xDF   /* iw3sp_mod K_LAST_KEY */
+
+/* iw3sp_mod GetGamePadCommand (Gamepad.cpp:988): remap a few shared
+ * commands to their gamepad-combined equivalents. */
+const char *gp_get_gamepad_command(const char *command)
+{
+    if ( strcmp(command, "+activate") == 0 || strcmp(command, "+reload") == 0 )
+        return "+usereload";
+    if ( strcmp(command, "+melee_breath") == 0 )
+        return "+holdbreath";
+    return command;
+}
+
+/* iw3sp_mod Key_IsValidGamePadChar (Gamepad.cpp:1473): true for the
+ * engine gamepad keynum ranges (BUTTON_* and DPAD_*). */
+qboolean gp_key_is_valid_gamepad_char(int key)
+{
+    return ( (key >= GAME_K_FIRSTGAMEPADBUTTON_RANGE_1 && key <= GAME_K_LASTGAMEPADBUTTON_RANGE_1)
+          || (key >= GAME_K_FIRSTGAMEPADBUTTON_RANGE_2 && key <= GAME_K_LASTGAMEPADBUTTON_RANGE_2)
+          || (key >= GAME_K_FIRSTGAMEPADBUTTON_RANGE_3 && key <= GAME_K_LASTGAMEPADBUTTON_RANGE_3) )
+        ? qtrue : qfalse;
+}
+
+/* Engine entry replacement (called via gamepad_stubs.asm). __cdecl, 3
+ * args. `keys` points to int[2]; fills with up to 2 matching keynums
+ * (or -1), returns the count. When the pad is in use, look up gamepad
+ * keynums for the remapped command; otherwise look up non-gamepad
+ * keynums for the raw command. */
+int __cdecl gp_key_getcmdassign(int localClientNum, const char *command, int *keys)
+{
+    int count = 0;
+    int k;
+
+    (void)localClientNum;   /* MAX_LOCAL_CLIENTS==1 -> always 0 */
+
+    keys[0] = -1;
+    keys[1] = -1;
+
+    if ( !command )
+        return 0;
+
+    if ( gp_state[0].inUse )
+    {
+        const char *gpCmd = gp_get_gamepad_command(command);
+        for ( k = 0; k < GP_K_LAST_KEY; ++k )
+        {
+            if ( !gp_key_is_valid_gamepad_char(k) )
+                continue;
+            if ( playerKeys.keys[k].binding
+              && strcmp(playerKeys.keys[k].binding, gpCmd) == 0 )
+            {
+                keys[count++] = k;
+                if ( count >= 2 )
+                    return count;
+            }
+        }
+    }
+    else
+    {
+        for ( k = 0; k < GP_K_LAST_KEY; ++k )
+        {
+            if ( gp_key_is_valid_gamepad_char(k) )
+                continue;
+            if ( playerKeys.keys[k].binding
+              && strcmp(playerKeys.keys[k].binding, command) == 0 )
+            {
+                keys[count++] = k;
+                if ( count >= 2 )
+                    return count;
+            }
+        }
+    }
+
+    return count;
+}
+
+/*
+===========
+gp_install_bindhooks
+
+Phase 3-E.3: install the binding-related engine hooks. For now just the
+Key_GetCommandAssignmentInternal entry replacement (naked trampoline).
+Idempotent; called from IN_StartupGamepads after gp_install_keynames.
+===========
+*/
+extern void gp_key_getcmdassign_stub(void);   /* gamepad_stubs.asm */
+
+void gp_install_bindhooks(void)
+{
+    static qboolean installed = qfalse;
+    if ( installed )
+        return;
+
+    GP_HOOK_JUMP( IW3MP_KEY_GETCMDASSIGN_JMP, gp_key_getcmdassign_stub );
+
+    installed = qtrue;
+    Com_Printf(CON_CHANNEL_SYSTEM,
+        "Gamepad bind hooks installed (Key_GetCommandAssignment @ 0x%X)\n",
+        (unsigned)IW3MP_KEY_GETCMDASSIGN_JMP);
 }

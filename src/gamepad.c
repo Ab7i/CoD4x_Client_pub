@@ -171,6 +171,10 @@ void IN_StartupGamepads(void)
     // them. Idempotent across in_restart.
     gp_install_keynames();
 
+    // Phase 3-E.3: install the gamepad-aware binding lookup hook
+    // (Key_GetCommandAssignment). Idempotent.
+    gp_install_bindhooks();
+
     Com_Printf(CON_CHANNEL_SYSTEM, "XInput initialized\n");
 }
 

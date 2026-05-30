@@ -79,6 +79,7 @@ add_library(cod4x SHARED
     src/callbacks.asm
     src/client_callbacks.asm
     src/fsdword.asm
+    src/gamepad_stubs.asm
 )
 
 if(OFFICIAL_BUILD)
