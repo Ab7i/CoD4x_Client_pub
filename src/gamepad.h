@@ -41,4 +41,14 @@ int __cdecl gp_key_getcmdassign(int localClientNum, const char *command, int *ke
 const char *gp_get_gamepad_command(const char *command);
 qboolean    gp_key_is_valid_gamepad_char(int key);
 
+// Phase 3-E.4a: install the 3 Key_SetBinding CALL-site hooks (idempotent).
+// Called from IN_StartupGamepads after gp_install_bindhooks.
+void gp_install_keysetbinding_hooks(void);
+
+// Phase 3-E.4a: Key_SetBinding wrapper -- tags gpad_buttonConfig="custom"
+// for gamepad keynums, then forwards to the engine inner binder via
+// gp_call_engine_keysetbinding (gamepad_stubs.asm). Called from the 3
+// naked trampolines (gp_key_setbinding_stub01/02/03). __cdecl.
+void __cdecl gp_key_setbinding_hk(int localClientNum, int keyNum, const char *binding);
+
 #endif // __GAMEPAD_H__

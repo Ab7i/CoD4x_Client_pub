@@ -280,3 +280,73 @@ void gp_install_bindhooks(void)
         "Gamepad bind hooks installed (Key_GetCommandAssignment @ 0x%X)\n",
         (unsigned)IW3MP_KEY_GETCMDASSIGN_JMP);
 }
+
+/* ===================================================================
+ * Phase 3-E.4a: Key_SetBinding hooks (3 CALL-site interceptions)
+ *
+ * The engine's Key_SetBinding (host iw3mp 0x552920) calls the inner
+ * binder (0x4678b0) three times. We intercept ALL three with HOOK_CALL
+ * (Patch_SetCall) so any binding that touches a gamepad keynum flips
+ * gpad_buttonConfig to "custom". The original binding write is then
+ * forwarded by gp_call_engine_keysetbinding (gamepad_stubs.asm) to the
+ * inner binder (0x4678b0) with the original __usercall convention.
+ *
+ * Path A note: only the BIND API is hooked here -- physical button
+ * presses still emit K_JOY1..16 (Path A). Migration of input emission
+ * to engine keynums is the separate 3-E.4b sub-phase.
+ * =================================================================== */
+
+extern void gp_key_setbinding_stub01(void);   /* gamepad_stubs.asm */
+extern void gp_key_setbinding_stub02(void);
+extern void gp_key_setbinding_stub03(void);
+extern void __cdecl gp_call_engine_keysetbinding(int lc, int keyNum,
+                                                 const char *binding);
+
+void __cdecl gp_key_setbinding_hk(int localClientNum, int keyNum, const char *binding)
+{
+    /* One-shot diagnostic so the first BUTTON_* bind in a session lands
+     * in the console (gated by cl_gamepad_debug). */
+    static int once = 0;
+    qboolean isGamepad = gp_key_is_valid_gamepad_char(keyNum);
+
+    if ( !once && cl_gamepad_debug && cl_gamepad_debug->boolean )
+    {
+        once = 1;
+        Com_Printf(CON_CHANNEL_SYSTEM,
+            "[gp] Key_SetBinding_Hk: lc=%d keyNum=%d binding=\"%s\" isGamepad=%d\n",
+            localClientNum, keyNum,
+            binding ? binding : "(null)",
+            (int)isGamepad);
+    }
+
+    if ( isGamepad && gpad_buttonConfig )
+    {
+        Cvar_SetString( gpad_buttonConfig, "custom" );
+    }
+
+    /* Forward to the engine's inner binder so the binding is actually
+     * stored. Preserves the original __usercall convention via the asm
+     * helper. */
+    gp_call_engine_keysetbinding( localClientNum, keyNum, binding );
+}
+
+void gp_install_keysetbinding_hooks(void)
+{
+    static qboolean installed = qfalse;
+    if ( installed )
+        return;
+
+    /* HOOK_CALL (Patch_SetCall): the 3 sites are CALL instructions; we
+     * only swap the call target. The engine's CALL still pushes the
+     * return address, so each stub ends with a plain `ret`. */
+    GP_HOOK_CALL( IW3MP_KEY_SETBIND_JMP_1, gp_key_setbinding_stub01 );
+    GP_HOOK_CALL( IW3MP_KEY_SETBIND_JMP_2, gp_key_setbinding_stub02 );
+    GP_HOOK_CALL( IW3MP_KEY_SETBIND_JMP_3, gp_key_setbinding_stub03 );
+
+    installed = qtrue;
+    Com_Printf(CON_CHANNEL_SYSTEM,
+        "Gamepad Key_SetBinding hooks installed (3 sites: 0x%X, 0x%X, 0x%X)\n",
+        (unsigned)IW3MP_KEY_SETBIND_JMP_1,
+        (unsigned)IW3MP_KEY_SETBIND_JMP_2,
+        (unsigned)IW3MP_KEY_SETBIND_JMP_3);
+}

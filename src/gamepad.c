@@ -62,14 +62,16 @@ cvar_t *cl_gamepad_deadzone_left;
 cvar_t *cl_gamepad_deadzone_right;
 cvar_t *cl_gamepad_legacy_sticks;   // Phase 3-C: 1 = Stage 3A path, 0 = new usercmd path
 cvar_t *cl_gamepad_invert_pitch;    // Phase 3-C: inverts pitchmove in the usercmd path
+cvar_t *gpad_buttonConfig;          // Phase 3-E.4a: "default" or "custom" (set by gamepad bind hooks)
 
 // gamepad.c-internal cvars (only read in this TU).
 static cvar_t *cl_gamepad_sens_ads;
 static cvar_t *cl_gamepad_invert_y;
 static cvar_t *cl_gamepad_accel_curve;
 
-// Temporary diagnostic cvar (flags 0 -- not archived).
-static cvar_t *cl_gamepad_debug;
+// Diagnostic cvar (flags 0 -- not archived). Non-static so the bind/key
+// hooks in gamepad_keys.c can gate their one-shot Printfs on it.
+cvar_t *cl_gamepad_debug;
 
 // Options for the cl_gamepad_accel_curve enum cvar (NULL-terminated).
 static const char *gamepad_accel_curve_names[] =
@@ -153,6 +155,14 @@ void IN_StartupGamepads(void)
         "(independent of cl_gamepad_invert_y which is the Stage 3A "
         "CL_MouseEvent-layer toggle)");
 
+    // Phase 3-E.4a: gamepad button-config dvar. Flips to "custom" the
+    // first time the user rebinds a BUTTON_*/DPAD_* key (via the engine
+    // Key_SetBinding hooks installed below). Used later by the menu UI
+    // to decide whether to save a custom layout vs re-apply a preset.
+    gpad_buttonConfig = Cvar_RegisterString(
+        "gpad_buttonConfig", "default", CVAR_ARCHIVE,
+        "Gamepad button-config state: 'default' or 'custom'");
+
     s_stick.was_enabled    = qfalse;
     s_stick.prev_move_fwd  = qfalse;
     s_stick.prev_move_back = qfalse;
@@ -174,6 +184,12 @@ void IN_StartupGamepads(void)
     // Phase 3-E.3: install the gamepad-aware binding lookup hook
     // (Key_GetCommandAssignment). Idempotent.
     gp_install_bindhooks();
+
+    // Phase 3-E.4a: install the 3 Key_SetBinding CALL-site hooks (so
+    // rebinding a BUTTON_*/DPAD_* key flips gpad_buttonConfig). Idempotent.
+    // (Migration of the install to Com_Init, for cfg-exec persistence,
+    // is a follow-up step -- see notes/stage3e4-key-setbinding.md.)
+    gp_install_keysetbinding_hooks();
 
     Com_Printf(CON_CHANNEL_SYSTEM, "XInput initialized\n");
 }

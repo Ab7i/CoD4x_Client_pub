@@ -466,5 +466,7 @@ extern cvar_t *cl_gamepad_deadzone_left;
 extern cvar_t *cl_gamepad_deadzone_right;
 extern cvar_t *cl_gamepad_legacy_sticks;   /* new in 3-C */
 extern cvar_t *cl_gamepad_invert_pitch;    /* new in 3-C */
+extern cvar_t *cl_gamepad_debug;           /* exposed in 3-E.4a for the bind-hook diagnostic */
+extern cvar_t *gpad_buttonConfig;          /* new in 3-E.4a: flips to "custom" when a gamepad bind is set */
 
 #endif /* __GAMEPAD_INTERNAL_H__ */

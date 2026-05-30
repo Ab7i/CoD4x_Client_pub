@@ -58,3 +58,64 @@ gp_key_getcmdassign_stub:
     popad                             ; restore GPRs
     pop     eax                       ; eax = return value (from the slot above)
     ret                               ; return to the engine caller
+
+; ---------------------------------------------------------------------
+; Phase 3-E.4a: Key_SetBinding hooks (3 trampolines + engine forwarder).
+;
+; The 3 hook sites are CALL instructions inside iw3mp Key_SetBinding
+; (0x552920) that all target 0x4678b0 (the engine's inner binder,
+; __usercall: eax=lc, ecx=keyNum, stack=binding). We install via
+; HOOK_CALL (Patch_SetCall) -- replace just the CALL target, not the
+; instruction kind. That way:
+;   - the engine's CALL still pushes its own return address (= jump-back
+;     to site+5), and our stub ends with a plain `ret`. No manual
+;     push/ret jump-back needed (cleaner than HOOK_JUMP).
+;
+; Register patterns at each site (DumpKeySetBinding.java):
+;   stub01/02: ECX, EAX are set; engine has already PUSH'd the binding
+;     string -- the Hk reads it as arg3 from [esp+0xC] after push ecx;
+;     push eax.
+;   stub03: EDX, ECX, EAX are set; engine has PUSH'd EDX (the binding)
+;     -- stub pushes EDX explicitly so the Hk sees a uniform cdecl
+;     signature.
+;
+; Hk signature (cdecl): void(int lc, int keyNum, const char *binding).
+; Matches iw3sp_mod (arg1=EAX, arg2=ECX, arg3=stack/EDX).
+; ---------------------------------------------------------------------
+
+    extern gp_key_setbinding_hk        ; void __cdecl(int lc, int keyNum, const char* binding)
+    global gp_key_setbinding_stub01
+    global gp_key_setbinding_stub02
+    global gp_key_setbinding_stub03
+    global gp_call_engine_keysetbinding
+
+gp_key_setbinding_stub01:
+gp_key_setbinding_stub02:
+    push    ecx                       ; arg2 = keyNum (engine had it in ECX)
+    push    eax                       ; arg1 = lc     (engine had it in EAX)
+    call    gp_key_setbinding_hk      ; void __cdecl(lc, keyNum, binding -- from engine push)
+    add     esp, 8                    ; clean our 2 pushes (engine cleans its string)
+    ret                               ; -> jump-back (engine's pushed return addr)
+
+gp_key_setbinding_stub03:
+    push    edx                       ; arg3 = binding (engine's PUSH EDX before the CALL)
+    push    ecx                       ; arg2 = keyNum
+    push    eax                       ; arg1 = lc
+    call    gp_key_setbinding_hk      ; void __cdecl(lc, keyNum, binding)
+    add     esp, 0xC                  ; clean our 3 pushes
+    ret
+
+; ---------------------------------------------------------------------
+; gp_call_engine_keysetbinding -- __cdecl forward to iw3mp 0x4678b0
+; (the engine inner binder we displaced). The engine uses __usercall:
+;   eax = lc, ecx = keyNum, [esp] = binding, caller cleans 4 bytes.
+; Our C Hk calls this to preserve the original binding-write behavior.
+; ---------------------------------------------------------------------
+gp_call_engine_keysetbinding:
+    mov     eax, dword [esp + 4]      ; lc
+    mov     ecx, dword [esp + 8]      ; keyNum
+    push    dword [esp + 12]          ; binding (now at +0xC after the push)
+    mov     edx, 0x4678b0             ; iw3mp inner binder
+    call    edx
+    add     esp, 4                    ; clean the binding arg (caller cleans)
+    ret
